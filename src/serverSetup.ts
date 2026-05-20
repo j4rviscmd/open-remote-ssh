@@ -477,7 +477,7 @@ else
 fi
 
 if [[ -f $SERVER_LOGFILE ]]; then
-    for i in {1..5}; do
+    for i in {1..30}; do
         LISTENING_ON="$(cat $SERVER_LOGFILE | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
         if [[ -n $LISTENING_ON ]]; then
             break
@@ -486,7 +486,8 @@ if [[ -f $SERVER_LOGFILE ]]; then
     done
 
     if [[ -z $LISTENING_ON ]]; then
-        echo "Error server did not start successfully"
+        echo "Error server did not start successfully. Server log:"
+        cat $SERVER_LOGFILE
         print_install_results_and_exit 1
     fi
 else
@@ -667,7 +668,7 @@ $SELECT_ARGUMENTS = @{
     Pattern = "Extension host agent listening on (\\d+)"
 }
 
-for($I = 1; $I -le 5; $I++) {
+for($I = 1; $I -le 30; $I++) {
     if(Test-Path $SERVER_LOGFILE) {
         $GROUPS = (Select-String @SELECT_ARGUMENTS).Matches.Groups
 
@@ -682,6 +683,13 @@ for($I = 1; $I -le 5; $I++) {
 
 if(!(Test-Path $SERVER_LOGFILE)) {
     "Error server log file not found $SERVER_LOGFILE"
+    printInstallResults 1
+    exit 0
+}
+
+if(-not $LISTENING_ON) {
+    "Error server did not start successfully. Server log:"
+    Get-Content $SERVER_LOGFILE
     printInstallResults 1
     exit 0
 }
