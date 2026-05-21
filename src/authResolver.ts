@@ -108,6 +108,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
         this.logger.info(`Resolving ssh remote authority '${authority}' (attempt #${context.resolveAttempt})`);
 
+        // On reconnection attempts, clean up stale connections from the previous resolve
+        if (context.resolveAttempt > 1) {
+            this.logger.info(`Reconnection attempt #${context.resolveAttempt}: cleaning up previous SSH connections`);
+            this.cleanupPreviousConnections();
+        }
+
         const sshDest = SSHDestination.parseEncoded(dest);
 
         // It looks like default values are not loaded yet when resolving a remote,
@@ -209,6 +215,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 // Create final ssh connection
                 const sshAuthHandler = this.getSSHAuthHandler(sshUser, sshHostName, identityKeys, preferredAuthentications);
 
+                this.logger.info(`Establishing SSH connection to ${sshHostName}:${sshPort} (attempt #${context.resolveAttempt})`);
                 this.sshConnection = new SSHConnection({
                     host: !proxyStream ? sshHostName : undefined,
                     port: !proxyStream ? sshPort : undefined,
@@ -223,6 +230,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
                 });
                 await this.sshConnection.connect();
+                this.logger.info(`SSH connection established successfully (attempt #${context.resolveAttempt})`);
 
                 const envVariables: Record<string, string | null> = {};
                 if (agentForward) {
@@ -232,7 +240,9 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 // Find the custom install path for this hostname (supports wildcards)
                 const customInstallPath = findServerInstallPath(sshDest.hostname, serverInstallPathMap);
 
+                this.logger.info(`Finding/installing code server (attempt #${context.resolveAttempt})...`);
                 const installResult = await installCodeServer(this.sshConnection, serverDownloadUrlTemplate, defaultExtensions, Object.keys(envVariables), remotePlatformMap[sshDest.hostname], remoteServerListenOnSocket, customInstallPath, this.logger);
+                this.logger.info(`Code server ready: listeningOn=${typeof installResult.listeningOn === 'number' ? installResult.listeningOn : '(socket)'} (attempt #${context.resolveAttempt})`);
 
                 for (const key of Object.keys(envVariables)) {
                     if (!isNullable(installResult[key])) {
@@ -282,7 +292,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 resolvedResult.extensionHostEnv = envVariables;
                 return resolvedResult;
             } catch (e: unknown) {
-                this.logger.error(`Error resolving authority`, e);
+                this.logger.error(`Error resolving authority (attempt #${context.resolveAttempt})`, e);
 
                 // Initial connection
                 if (context.resolveAttempt === 1) {
@@ -296,6 +306,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     } else if (result === retry) {
                         await vscode.commands.executeCommand('workbench.action.reloadWindow');
                     }
+                } else {
+                    this.logger.info(`Reconnection attempt #${context.resolveAttempt} failed, will throw TemporarilyNotAvailable to trigger retry`);
                 }
 
                 if (e instanceof ServerInstallError || !(e instanceof Error)) {
@@ -469,6 +481,43 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
             callback(false);
         };
+    }
+
+    /**
+     * Clean up previous SSH connections before establishing new ones on reconnection.
+     * Without this, dead SSH connections and proxy processes would leak resources
+     * and potentially interfere with the new connection establishment.
+     */
+    private cleanupPreviousConnections(): void {
+        // Close proxy connections (outermost first closes the chain)
+        if (this.proxyConnections.length) {
+            try {
+                this.proxyConnections[0].close();
+            } catch (e) {
+                this.logger.trace(`Error closing proxy connections during cleanup: ${e}`);
+            }
+            this.proxyConnections = [];
+        }
+
+        // Close the main SSH connection
+        if (this.sshConnection) {
+            try {
+                this.sshConnection.close();
+            } catch (e) {
+                this.logger.trace(`Error closing SSH connection during cleanup: ${e}`);
+            }
+            this.sshConnection = undefined;
+        }
+
+        // Kill any lingering ProxyCommand process
+        if (this.proxyCommandProcess) {
+            try {
+                this.proxyCommandProcess.kill();
+            } catch (e) {
+                this.logger.trace(`Error killing proxy command process during cleanup: ${e}`);
+            }
+            this.proxyCommandProcess = undefined;
+        }
     }
 
     dispose() {
