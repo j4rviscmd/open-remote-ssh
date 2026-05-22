@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import Log from './common/logger';
 import { getVSCodeServerConfig } from './serverConfig';
-import SSHConnection from './ssh/sshConnection';
+import { ISSHSession } from './ssh/sshSession';
 
 /**
  * Matches a hostname against a pattern that may contain wildcards.
@@ -92,7 +92,7 @@ export class ServerInstallError extends Error {
 
 const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz';
 
-export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTemplate: string | undefined, extensionIds: string[], envVariables: string[], platform: string | undefined, useSocketPath: boolean, customInstallPath: string | undefined, logger: Log): Promise<ServerInstallResult> {
+export async function installCodeServer(conn: ISSHSession, serverDownloadUrlTemplate: string | undefined, extensionIds: string[], envVariables: string[], platform: string | undefined, useSocketPath: boolean, customInstallPath: string | undefined, logger: Log): Promise<ServerInstallResult> {
     let shell = 'powershell';
 
     // detect platform and shell for windows

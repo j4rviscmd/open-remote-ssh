@@ -1,0 +1,540 @@
+import * as cp from 'child_process';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import * as stream from 'stream';
+import Log from '../common/logger';
+import { ISSHSession } from './sshSession';
+import { AskpassServer } from './askpassServer';
+import { isWindows } from '../common/platform';
+import { findRandomPort } from '../common/ports';
+
+export interface SSHCliConfig {
+	host: string;
+	port: number;
+	username: string;
+	/** Additional SSH options (e.g., from ssh_config) */
+	extraArgs?: string[];
+	/** Connection timeout in seconds */
+	connectTimeout?: number;
+}
+
+/**
+ * SSH session implementation using the OS `ssh` binary with ControlMaster.
+ *
+ * Advantages over the ssh2 library:
+ * - Full SSH config support (~/.ssh/config)
+ * - FIDO2/ed25519-sk key support
+ * - GSSAPI/Kerberos authentication
+ * - ControlMaster multiplexing
+ * - ProxyJump/ProxyCommand handled natively by OpenSSH
+ *
+ * Note: ControlMaster is not supported on Windows.
+ * Windows fallback uses individual ssh processes per operation.
+ */
+export class SSHCli implements ISSHSession {
+	private controlPath: string;
+	private masterProcess: cp.ChildProcess | undefined;
+	private askpassServer: AskpassServer;
+	private askpassScript: string = '';
+	private connected: boolean = false;
+	private childProcesses: cp.ChildProcess[] = [];
+
+	constructor(
+		private readonly config: SSHCliConfig,
+		private readonly logger: Log,
+		askpassServer: AskpassServer
+	) {
+		this.askpassServer = askpassServer;
+
+		// Generate a short ControlMaster socket path.
+		// Unix domain socket paths have a max length (104 on macOS, 108 on Linux).
+		// OpenSSH may append a random suffix (~20 chars), so we keep our path very short.
+		// Use /tmp directly (short) and a hash of the connection identity.
+		const identity = `${this.config.username}@${this.config.host}:${this.config.port}:${process.pid}`;
+		const hash = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 8);
+		this.controlPath = `/tmp/ors-${hash}`;
+	}
+
+	/**
+	 * Establish the ControlMaster SSH connection.
+	 */
+	async connect(): Promise<void> {
+		if (this.connected) {
+			return;
+		}
+
+		// Ensure askpass script is created
+		await this.ensureAskpassScript();
+
+		const args = this.buildSSHArgs([
+			'-o', 'ControlMaster=yes',
+			'-o', `ControlPath=${this.controlPath}`,
+			'-o', 'ControlPersist=yes',
+			'-N', // No remote command
+		]);
+
+		this.logger.info(`Establishing ControlMaster connection: ssh ${args.join(' ')}`);
+
+		const env = this.buildEnv();
+
+		await new Promise<void>((resolve, reject) => {
+			const proc = cp.spawn('ssh', args, {
+				env,
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+
+			this.masterProcess = proc;
+
+			let stderr = '';
+			proc.stderr?.on('data', (data: Buffer) => {
+				stderr += data.toString();
+				this.logger.trace(`[ControlMaster stderr] ${data.toString().trim()}`);
+			});
+
+			proc.on('error', (err) => {
+				reject(new Error(`Failed to spawn ssh: ${err.message}`));
+			});
+
+			proc.on('exit', (code) => {
+				// With ControlPersist=yes, ssh forks into background and exits with code 0.
+				// This is expected behavior - only reject on non-zero exit codes.
+				if (!this.connected && code !== 0) {
+					reject(new Error(`SSH ControlMaster exited with code ${code}: ${stderr.trim()}`));
+				}
+			});
+
+			// Wait for the control socket to appear
+			this.waitForControlSocket(this.config.connectTimeout || 60)
+				.then(() => {
+					this.connected = true;
+					this.logger.info('ControlMaster connection established');
+					resolve();
+				})
+				.catch((err) => {
+					proc.kill();
+					reject(err);
+				});
+		});
+	}
+
+	/**
+	 * Execute a command on the remote host.
+	 */
+	async exec(cmd: string): Promise<{ stdout: string; stderr: string }> {
+		this.ensureConnected();
+
+		const args = this.buildMuxArgs([], cmd);
+
+		this.logger.trace(`Executing: ssh ${args.join(' ')}`);
+
+		return new Promise((resolve, reject) => {
+			const proc = cp.spawn('ssh', args, {
+				env: this.buildEnv(),
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+
+			this.childProcesses.push(proc);
+
+			let stdout = '';
+			let stderr = '';
+
+			proc.stdout?.on('data', (data: Buffer) => {
+				stdout += data.toString();
+			});
+
+			proc.stderr?.on('data', (data: Buffer) => {
+				stderr += data.toString();
+			});
+
+			proc.on('error', (err) => {
+				this.removeChildProcess(proc);
+				reject(err);
+			});
+
+			proc.on('close', () => {
+				this.removeChildProcess(proc);
+				resolve({ stdout, stderr });
+			});
+		});
+	}
+
+	/**
+	 * Execute a command and resolve early when tester returns true.
+	 */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	async execPartial(cmd: string, tester: (stdout: string, stderr: string) => boolean, _params?: Array<string>): Promise<{ stdout: string; stderr: string }> {
+		this.ensureConnected();
+
+		const args = this.buildMuxArgs([], cmd);
+
+		this.logger.trace(`Executing (partial): ssh ${args.join(' ')}`);
+
+		return new Promise((resolve, reject) => {
+			const proc = cp.spawn('ssh', args, {
+				env: this.buildEnv(),
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+
+			this.childProcesses.push(proc);
+
+			let stdout = '';
+			let stderr = '';
+			let resolved = false;
+
+			proc.stdout?.on('data', (data: Buffer) => {
+				stdout += data.toString();
+				if (!resolved && tester(stdout, stderr)) {
+					resolved = true;
+					resolve({ stdout, stderr });
+				}
+			});
+
+			proc.stderr?.on('data', (data: Buffer) => {
+				stderr += data.toString();
+				if (!resolved && tester(stdout, stderr)) {
+					resolved = true;
+					resolve({ stdout, stderr });
+				}
+			});
+
+			proc.on('error', (err) => {
+				this.removeChildProcess(proc);
+				if (!resolved) {
+					reject(err);
+				}
+			});
+
+			proc.on('close', () => {
+				this.removeChildProcess(proc);
+				if (!resolved) {
+					resolve({ stdout, stderr });
+				}
+			});
+		});
+	}
+
+	/**
+	 * Forward a TCP connection using ssh -W (stdio forwarding).
+	 * Returns a bidirectional stream connected to destIP:destPort on the remote host.
+	 */
+	async forwardOut(_srcIP: string, _srcPort: number, destIP: string, destPort: number): Promise<stream.Duplex> {
+		this.ensureConnected();
+
+		const args = this.buildMuxArgs(['-W', `${destIP}:${destPort}`]);
+
+		this.logger.trace(`Forwarding out (stdio): ssh ${args.join(' ')}`);
+
+		const proc = cp.spawn('ssh', args, {
+			env: this.buildEnv(),
+			stdio: ['pipe', 'pipe', 'pipe'],
+		});
+
+		this.childProcesses.push(proc);
+
+		proc.stderr?.on('data', (data: Buffer) => {
+			this.logger.trace(`[forwardOut stderr] ${data.toString().trim()}`);
+		});
+
+		proc.on('exit', () => {
+			this.removeChildProcess(proc);
+		});
+
+		// Create a Duplex stream that wraps the child process stdin/stdout
+		const duplex = new stream.Duplex({
+			read() {
+				// Data is pushed from stdout listener
+			},
+			write(chunk, _encoding, callback) {
+				if (proc.stdin?.writable) {
+					proc.stdin.write(chunk, callback);
+				} else {
+					callback(new Error('SSH process stdin not writable'));
+				}
+			},
+			final(callback) {
+				proc.stdin?.end();
+				callback();
+			},
+			destroy(err, callback) {
+				proc.kill();
+				callback(err);
+			}
+		});
+
+		proc.stdout?.on('data', (data: Buffer) => {
+			duplex.push(data);
+		});
+
+		proc.stdout?.on('end', () => {
+			duplex.push(null);
+		});
+
+		proc.on('error', (err) => {
+			duplex.destroy(err);
+		});
+
+		proc.on('close', () => {
+			duplex.push(null);
+		});
+
+		return duplex;
+	}
+
+	/**
+	 * Forward a connection to a remote Unix domain socket.
+	 * Uses local port forwarding (-L) and connects a TCP socket to it.
+	 */
+	async forwardOutStreamLocal(socketPath: string): Promise<stream.Duplex> {
+		this.ensureConnected();
+
+		// Find a free local port for the forward
+		const localPort = await findRandomPort();
+
+		// Set up local port forwarding to the remote Unix socket
+		const args = this.buildMuxArgs([
+			'-L', `${localPort}:${socketPath}`,
+			'-N', // No remote command
+		]);
+
+		this.logger.trace(`Forwarding stream local: ssh ${args.join(' ')}`);
+
+		const proc = cp.spawn('ssh', args, {
+			env: this.buildEnv(),
+			stdio: ['pipe', 'pipe', 'pipe'],
+		});
+
+		this.childProcesses.push(proc);
+
+		proc.stderr?.on('data', (data: Buffer) => {
+			this.logger.trace(`[forwardOutStreamLocal stderr] ${data.toString().trim()}`);
+		});
+
+		proc.on('exit', () => {
+			this.removeChildProcess(proc);
+		});
+
+		// Wait a short time for the port forward to establish
+		await new Promise(resolve => setTimeout(resolve, 500));
+
+		// Connect to the local forwarded port
+		const socket = await this.connectToLocalPort(localPort);
+
+		// Wrap the socket to also kill the ssh process on close
+		const originalDestroy = socket.destroy.bind(socket);
+		socket.destroy = (error?: Error) => {
+			proc.kill();
+			return originalDestroy(error);
+		};
+
+		return socket;
+	}
+
+	/**
+	 * Close the SSH session and clean up all resources.
+	 */
+	async close(): Promise<void> {
+		// Kill all child processes
+		for (const proc of this.childProcesses) {
+			try { proc.kill(); } catch { /* ignore */ }
+		}
+		this.childProcesses = [];
+
+		if (!this.connected) {
+			return;
+		}
+
+		// Send exit command to ControlMaster
+		try {
+			const args = [
+				'-o', `ControlPath=${this.controlPath}`,
+				'-O', 'exit',
+				`${this.config.username}@${this.config.host}`,
+			];
+
+			this.logger.trace(`Closing ControlMaster: ssh ${args.join(' ')}`);
+
+			cp.spawnSync('ssh', args, { timeout: 5000 });
+		} catch (e) {
+			this.logger.trace(`Error closing ControlMaster: ${e}`);
+		}
+
+		// Kill master process if still alive
+		if (this.masterProcess) {
+			try { this.masterProcess.kill(); } catch { /* ignore */ }
+			this.masterProcess = undefined;
+		}
+
+		// Clean up control socket
+		try {
+			if (fs.existsSync(this.controlPath)) {
+				fs.unlinkSync(this.controlPath);
+			}
+		} catch { /* ignore */ }
+
+		// Clean up askpass script
+		if (this.askpassScript) {
+			try { fs.unlinkSync(this.askpassScript); } catch { /* ignore */ }
+		}
+
+		this.connected = false;
+	}
+
+	// --- Private helpers ---
+
+	private ensureConnected(): void {
+		if (!this.connected) {
+			throw new Error('SSH session not connected. Call connect() first.');
+		}
+	}
+
+	/**
+	 * Build base SSH args common to all operations.
+	 */
+	private buildSSHArgs(extraArgs: string[]): string[] {
+		const args: string[] = [
+			'-o', 'StrictHostKeyChecking=accept-new',
+			'-o', `ConnectTimeout=${this.config.connectTimeout || 60}`,
+			'-o', 'ServerAliveInterval=60',
+			'-o', 'ServerAliveCountMax=4',
+			'-p', this.config.port.toString(),
+		];
+
+		if (this.config.extraArgs) {
+			args.push(...this.config.extraArgs);
+		}
+
+		args.push(...extraArgs);
+		args.push(`${this.config.username}@${this.config.host}`);
+
+		return args;
+	}
+
+	/**
+	 * Build SSH args for multiplexed operations (using ControlPath).
+	 * @param sshOptions - SSH options to place before user@host
+	 * @param remoteCommand - Optional command to execute on the remote (placed after user@host)
+	 */
+	private buildMuxArgs(sshOptions: string[], remoteCommand?: string): string[] {
+		const args: string[] = [
+			'-o', `ControlPath=${this.controlPath}`,
+			'-o', 'ControlMaster=no',
+			'-p', this.config.port.toString(),
+		];
+
+		args.push(...sshOptions);
+		args.push(`${this.config.username}@${this.config.host}`);
+
+		if (remoteCommand) {
+			args.push(remoteCommand);
+		}
+
+		return args;
+	}
+
+	/**
+	 * Build environment variables for SSH process.
+	 */
+	private buildEnv(): NodeJS.ProcessEnv {
+		const env: NodeJS.ProcessEnv = { ...process.env };
+
+		if (this.askpassScript && this.askpassServer.port > 0) {
+			env['SSH_ASKPASS'] = this.askpassScript;
+			env['SSH_ASKPASS_REQUIRE'] = 'force';
+			env['DISPLAY'] = ':0'; // Required for SSH_ASKPASS to be used
+			env['SSH_ASKPASS_PORT'] = this.askpassServer.port.toString();
+		}
+
+		// Prevent SSH from reading from terminal directly
+		// (forces use of SSH_ASKPASS)
+		delete env['SSH_TERMINAL'];
+
+		return env;
+	}
+
+	/**
+	 * Wait for the ControlMaster socket file to appear.
+	 */
+	private async waitForControlSocket(timeoutSecs: number): Promise<void> {
+		const startTime = Date.now();
+		const timeoutMs = timeoutSecs * 1000;
+		const pollInterval = 200; // ms
+
+		while (Date.now() - startTime < timeoutMs) {
+			if (fs.existsSync(this.controlPath)) {
+				// Verify the socket is usable with -O check
+				const result = cp.spawnSync('ssh', [
+					'-o', `ControlPath=${this.controlPath}`,
+					'-O', 'check',
+					`${this.config.username}@${this.config.host}`,
+				], { timeout: 5000 });
+
+				if (result.status === 0) {
+					return;
+				}
+			}
+
+			await new Promise(resolve => setTimeout(resolve, pollInterval));
+		}
+
+		throw new Error(`Timed out waiting for ControlMaster socket after ${timeoutSecs}s`);
+	}
+
+	/**
+	 * Ensure the askpass helper script exists.
+	 */
+	private async ensureAskpassScript(): Promise<void> {
+		if (this.askpassScript && fs.existsSync(this.askpassScript)) {
+			return;
+		}
+
+		const scriptDir = path.join(os.tmpdir(), 'open-remote-ssh');
+		if (!fs.existsSync(scriptDir)) {
+			fs.mkdirSync(scriptDir, { recursive: true, mode: 0o700 });
+		}
+
+		if (isWindows) {
+			this.askpassScript = path.join(scriptDir, `askpass-${process.pid}.cmd`);
+			const content = `@echo off\r\ncurl -sf --data-urlencode "prompt=%~1" "http://127.0.0.1:%SSH_ASKPASS_PORT%/askpass"\r\n`;
+			fs.writeFileSync(this.askpassScript, content, { mode: 0o700 });
+		} else {
+			this.askpassScript = path.join(scriptDir, `askpass-${process.pid}.sh`);
+			const content = `#!/bin/sh\nexec curl -sf --data-urlencode "prompt=$1" "http://127.0.0.1:$SSH_ASKPASS_PORT/askpass"\n`;
+			fs.writeFileSync(this.askpassScript, content, { mode: 0o755 });
+		}
+
+		this.logger.trace(`Askpass script created: ${this.askpassScript}`);
+	}
+
+	/**
+	 * Connect to a local TCP port with retry.
+	 */
+	private async connectToLocalPort(port: number, retries: number = 10, delay: number = 200): Promise<net.Socket> {
+		for (let i = 0; i < retries; i++) {
+			try {
+				return await new Promise<net.Socket>((resolve, reject) => {
+					const socket = net.connect(port, '127.0.0.1', () => {
+						resolve(socket);
+					});
+					socket.on('error', reject);
+				});
+			} catch {
+				if (i === retries - 1) {
+					throw new Error(`Failed to connect to local forwarded port ${port} after ${retries} attempts`);
+				}
+				await new Promise(resolve => setTimeout(resolve, delay));
+			}
+		}
+
+		throw new Error(`Failed to connect to local forwarded port ${port}`);
+	}
+
+	private removeChildProcess(proc: cp.ChildProcess): void {
+		const idx = this.childProcesses.indexOf(proc);
+		if (idx >= 0) {
+			this.childProcesses.splice(idx, 1);
+		}
+	}
+}

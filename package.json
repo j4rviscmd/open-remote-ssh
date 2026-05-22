@@ -156,6 +156,12 @@
 					"description": "**Experimental:** The name of the server binary, use this **only if** you are using a client without a corresponding server release",
 					"scope": "application",
 					"default": ""
+				},
+				"remote.SSH.useSSHCli": {
+					"type": "boolean",
+					"description": "Use the OS ssh binary with ControlMaster for SSH connections instead of the built-in ssh2 library. This enables support for FIDO2/ed25519-sk keys, GSSAPI/Kerberos, full SSH config options, and ControlMaster multiplexing. Only effective on macOS and Linux; Windows always uses the built-in ssh2 library.",
+					"scope": "application",
+					"default": true
 				}
 			}
 		},
