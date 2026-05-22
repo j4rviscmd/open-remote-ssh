@@ -19,28 +19,32 @@ export interface SSHCliConfig {
 	extraArgs?: string[];
 	/** Connection timeout in seconds */
 	connectTimeout?: number;
+	/** Custom path to the ssh binary (defaults to 'ssh' in PATH) */
+	sshPath?: string;
 }
 
 /**
- * SSH session implementation using the OS `ssh` binary with ControlMaster.
+ * SSH session implementation using the OS `ssh` binary.
+ *
+ * On macOS/Linux, uses ControlMaster for connection multiplexing.
+ * On Windows, spawns individual ssh processes per operation (no ControlMaster).
  *
  * Advantages over the ssh2 library:
  * - Full SSH config support (~/.ssh/config)
  * - FIDO2/ed25519-sk key support
  * - GSSAPI/Kerberos authentication
- * - ControlMaster multiplexing
+ * - ControlMaster multiplexing (macOS/Linux)
  * - ProxyJump/ProxyCommand handled natively by OpenSSH
- *
- * Note: ControlMaster is not supported on Windows.
- * Windows fallback uses individual ssh processes per operation.
  */
 export class SSHCli implements ISSHSession {
-	private controlPath: string;
+	private controlPath: string = '';
 	private masterProcess: cp.ChildProcess | undefined;
 	private askpassServer: AskpassServer;
 	private askpassScript: string = '';
 	private connected: boolean = false;
 	private childProcesses: cp.ChildProcess[] = [];
+	private readonly useControlMaster: boolean;
+	private readonly sshBinary: string;
 
 	constructor(
 		private readonly config: SSHCliConfig,
@@ -48,18 +52,24 @@ export class SSHCli implements ISSHSession {
 		askpassServer: AskpassServer
 	) {
 		this.askpassServer = askpassServer;
+		this.sshBinary = config.sshPath || 'ssh';
+		this.useControlMaster = !isWindows;
 
-		// Generate a short ControlMaster socket path.
-		// Unix domain socket paths have a max length (104 on macOS, 108 on Linux).
-		// OpenSSH may append a random suffix (~20 chars), so we keep our path very short.
-		// Use /tmp directly (short) and a hash of the connection identity.
-		const identity = `${this.config.username}@${this.config.host}:${this.config.port}:${process.pid}`;
-		const hash = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 8);
-		this.controlPath = `/tmp/ors-${hash}`;
+		if (this.useControlMaster) {
+			// Generate a short ControlMaster socket path.
+			// Unix domain socket paths have a max length (104 on macOS, 108 on Linux).
+			// OpenSSH may append a random suffix (~20 chars), so we keep our path very short.
+			// Use /tmp directly (short) and a hash of the connection identity.
+			const identity = `${this.config.username}@${this.config.host}:${this.config.port}:${process.pid}`;
+			const hash = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 8);
+			this.controlPath = `/tmp/ors-${hash}`;
+		}
 	}
 
 	/**
-	 * Establish the ControlMaster SSH connection.
+	 * Establish the SSH connection.
+	 * On macOS/Linux: starts a ControlMaster for connection multiplexing.
+	 * On Windows: verifies connectivity with a simple ssh command.
 	 */
 	async connect(): Promise<void> {
 		if (this.connected) {
@@ -69,6 +79,17 @@ export class SSHCli implements ISSHSession {
 		// Ensure askpass script is created
 		await this.ensureAskpassScript();
 
+		if (this.useControlMaster) {
+			await this.connectWithControlMaster();
+		} else {
+			await this.connectDirect();
+		}
+	}
+
+	/**
+	 * Establish ControlMaster connection (macOS/Linux).
+	 */
+	private async connectWithControlMaster(): Promise<void> {
 		const args = this.buildSSHArgs([
 			'-o', 'ControlMaster=yes',
 			'-o', `ControlPath=${this.controlPath}`,
@@ -76,12 +97,12 @@ export class SSHCli implements ISSHSession {
 			'-N', // No remote command
 		]);
 
-		this.logger.info(`Establishing ControlMaster connection: ssh ${args.join(' ')}`);
+		this.logger.info(`Establishing ControlMaster connection: ${this.sshBinary} ${args.join(' ')}`);
 
 		const env = this.buildEnv();
 
 		await new Promise<void>((resolve, reject) => {
-			const proc = cp.spawn('ssh', args, {
+			const proc = cp.spawn(this.sshBinary, args, {
 				env,
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
@@ -121,17 +142,60 @@ export class SSHCli implements ISSHSession {
 	}
 
 	/**
+	 * Establish direct connection without ControlMaster (Windows).
+	 * Verifies SSH connectivity by running a simple command.
+	 */
+	private async connectDirect(): Promise<void> {
+		const args = this.buildSSHArgs([]);
+
+		// Append a simple test command after user@host
+		args.push('echo', 'ok');
+
+		this.logger.info(`Verifying SSH connectivity (direct mode): ${this.sshBinary} ${args.join(' ')}`);
+
+		const env = this.buildEnv();
+
+		await new Promise<void>((resolve, reject) => {
+			const proc = cp.spawn(this.sshBinary, args, {
+				env,
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+
+			let stderr = '';
+			proc.stderr?.on('data', (data: Buffer) => {
+				stderr += data.toString();
+			});
+
+			proc.on('error', (err) => {
+				reject(new Error(`Failed to spawn ssh: ${err.message}`));
+			});
+
+			proc.on('close', (code) => {
+				if (code === 0) {
+					this.connected = true;
+					this.logger.info('SSH connectivity verified (direct mode)');
+					resolve();
+				} else {
+					reject(new Error(`SSH connection test failed with code ${code}: ${stderr.trim()}`));
+				}
+			});
+		});
+	}
+
+	/**
 	 * Execute a command on the remote host.
 	 */
 	async exec(cmd: string): Promise<{ stdout: string; stderr: string }> {
 		this.ensureConnected();
 
-		const args = this.buildMuxArgs([], cmd);
+		const args = this.useControlMaster
+			? this.buildMuxArgs([], cmd)
+			: this.buildSSHArgs([], cmd);
 
-		this.logger.trace(`Executing: ssh ${args.join(' ')}`);
+		this.logger.trace(`Executing: ${this.sshBinary} ${args.join(' ')}`);
 
 		return new Promise((resolve, reject) => {
-			const proc = cp.spawn('ssh', args, {
+			const proc = cp.spawn(this.sshBinary, args, {
 				env: this.buildEnv(),
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
@@ -168,12 +232,14 @@ export class SSHCli implements ISSHSession {
 	async execPartial(cmd: string, tester: (stdout: string, stderr: string) => boolean, _params?: Array<string>): Promise<{ stdout: string; stderr: string }> {
 		this.ensureConnected();
 
-		const args = this.buildMuxArgs([], cmd);
+		const args = this.useControlMaster
+			? this.buildMuxArgs([], cmd)
+			: this.buildSSHArgs([], cmd);
 
-		this.logger.trace(`Executing (partial): ssh ${args.join(' ')}`);
+		this.logger.trace(`Executing (partial): ${this.sshBinary} ${args.join(' ')}`);
 
 		return new Promise((resolve, reject) => {
-			const proc = cp.spawn('ssh', args, {
+			const proc = cp.spawn(this.sshBinary, args, {
 				env: this.buildEnv(),
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
@@ -223,11 +289,13 @@ export class SSHCli implements ISSHSession {
 	async forwardOut(_srcIP: string, _srcPort: number, destIP: string, destPort: number): Promise<stream.Duplex> {
 		this.ensureConnected();
 
-		const args = this.buildMuxArgs(['-W', `${destIP}:${destPort}`]);
+		const args = this.useControlMaster
+			? this.buildMuxArgs(['-W', `${destIP}:${destPort}`])
+			: this.buildSSHArgs(['-W', `${destIP}:${destPort}`]);
 
-		this.logger.trace(`Forwarding out (stdio): ssh ${args.join(' ')}`);
+		this.logger.trace(`Forwarding out (stdio): ${this.sshBinary} ${args.join(' ')}`);
 
-		const proc = cp.spawn('ssh', args, {
+		const proc = cp.spawn(this.sshBinary, args, {
 			env: this.buildEnv(),
 			stdio: ['pipe', 'pipe', 'pipe'],
 		});
@@ -294,14 +362,13 @@ export class SSHCli implements ISSHSession {
 		const localPort = await findRandomPort();
 
 		// Set up local port forwarding to the remote Unix socket
-		const args = this.buildMuxArgs([
-			'-L', `${localPort}:${socketPath}`,
-			'-N', // No remote command
-		]);
+		const args = this.useControlMaster
+			? this.buildMuxArgs(['-L', `${localPort}:${socketPath}`, '-N'])
+			: this.buildSSHArgs(['-L', `${localPort}:${socketPath}`, '-N']);
 
-		this.logger.trace(`Forwarding stream local: ssh ${args.join(' ')}`);
+		this.logger.trace(`Forwarding stream local: ${this.sshBinary} ${args.join(' ')}`);
 
-		const proc = cp.spawn('ssh', args, {
+		const proc = cp.spawn(this.sshBinary, args, {
 			env: this.buildEnv(),
 			stdio: ['pipe', 'pipe', 'pipe'],
 		});
@@ -346,33 +413,35 @@ export class SSHCli implements ISSHSession {
 			return;
 		}
 
-		// Send exit command to ControlMaster
-		try {
-			const args = [
-				'-o', `ControlPath=${this.controlPath}`,
-				'-O', 'exit',
-				`${this.config.username}@${this.config.host}`,
-			];
+		// Send exit command to ControlMaster (macOS/Linux only)
+		if (this.useControlMaster) {
+			try {
+				const args = [
+					'-o', `ControlPath=${this.controlPath}`,
+					'-O', 'exit',
+					`${this.config.username}@${this.config.host}`,
+				];
 
-			this.logger.trace(`Closing ControlMaster: ssh ${args.join(' ')}`);
+				this.logger.trace(`Closing ControlMaster: ${this.sshBinary} ${args.join(' ')}`);
 
-			cp.spawnSync('ssh', args, { timeout: 5000 });
-		} catch (e) {
-			this.logger.trace(`Error closing ControlMaster: ${e}`);
-		}
-
-		// Kill master process if still alive
-		if (this.masterProcess) {
-			try { this.masterProcess.kill(); } catch { /* ignore */ }
-			this.masterProcess = undefined;
-		}
-
-		// Clean up control socket
-		try {
-			if (fs.existsSync(this.controlPath)) {
-				fs.unlinkSync(this.controlPath);
+				cp.spawnSync(this.sshBinary, args, { timeout: 5000 });
+			} catch (e) {
+				this.logger.trace(`Error closing ControlMaster: ${e}`);
 			}
-		} catch { /* ignore */ }
+
+			// Kill master process if still alive
+			if (this.masterProcess) {
+				try { this.masterProcess.kill(); } catch { /* ignore */ }
+				this.masterProcess = undefined;
+			}
+
+			// Clean up control socket
+			try {
+				if (fs.existsSync(this.controlPath)) {
+					fs.unlinkSync(this.controlPath);
+				}
+			} catch { /* ignore */ }
+		}
 
 		// Clean up askpass script
 		if (this.askpassScript) {
@@ -392,8 +461,10 @@ export class SSHCli implements ISSHSession {
 
 	/**
 	 * Build base SSH args common to all operations.
+	 * @param extraArgs - SSH options to place before user@host
+	 * @param remoteCommand - Optional command to execute on the remote (placed after user@host)
 	 */
-	private buildSSHArgs(extraArgs: string[]): string[] {
+	private buildSSHArgs(extraArgs: string[], remoteCommand?: string): string[] {
 		const args: string[] = [
 			'-o', 'StrictHostKeyChecking=accept-new',
 			'-o', `ConnectTimeout=${this.config.connectTimeout || 60}`,
@@ -408,6 +479,10 @@ export class SSHCli implements ISSHSession {
 
 		args.push(...extraArgs);
 		args.push(`${this.config.username}@${this.config.host}`);
+
+		if (remoteCommand) {
+			args.push(remoteCommand);
+		}
 
 		return args;
 	}
@@ -465,7 +540,7 @@ export class SSHCli implements ISSHSession {
 		while (Date.now() - startTime < timeoutMs) {
 			if (fs.existsSync(this.controlPath)) {
 				// Verify the socket is usable with -O check
-				const result = cp.spawnSync('ssh', [
+				const result = cp.spawnSync(this.sshBinary, [
 					'-o', `ControlPath=${this.controlPath}`,
 					'-O', 'check',
 					`${this.config.username}@${this.config.host}`,

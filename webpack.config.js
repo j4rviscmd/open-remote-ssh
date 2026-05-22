@@ -3,7 +3,6 @@
 'use strict';
 
 const path = require('path');
-const webpack = require('webpack');
 
 /**@type {import('webpack').Configuration}*/
 const config = {
@@ -18,8 +17,6 @@ const config = {
 	devtool: 'source-map',
 	externals: {
 		vscode: "commonjs vscode",
-		bufferutil: "bufferutil",
-		"utf-8-validate": "utf-8-validate",
 	},
 	resolve: {
 		extensions: ['.ts', '.js']
@@ -33,14 +30,7 @@ const config = {
 			}]
 		}]
 	},
-	plugins: [
-		new webpack.IgnorePlugin({
-			resourceRegExp: /crypto\/build\/Release\/sshcrypto\.node$/,
-		}),
-		new webpack.IgnorePlugin({
-			resourceRegExp: /cpu-features/,
-		})
-	]
+	plugins: []
 }
 
 module.exports = (_env, argv) => {

@@ -1,25 +1,14 @@
-import * as cp from 'child_process';
-import * as fs from 'fs';
 import * as stream from 'stream';
 import * as vscode from 'vscode';
-import * as ssh2 from 'ssh2';
-import type { ParsedKey } from 'ssh2-streams';
 import Log from './common/logger';
 import SSHDestination from './ssh/sshDestination';
-import SSHConnection from './ssh/sshConnection';
 import SSHConfiguration from './ssh/sshConfig';
-import { gatherIdentityFiles } from './ssh/identityFiles';
-import { untildify, exists as fileExists } from './common/files';
 import { installCodeServer, ServerInstallError, findServerInstallPath } from './serverSetup';
-import { isWindows } from './common/platform';
 import { ISSHSession } from './ssh/sshSession';
 import { SSHCli } from './ssh/sshCli';
 import { AskpassServer } from './ssh/askpassServer';
 import * as os from 'os';
 import { isNullable } from '@zokugun/is-it-type';
-
-const PASSWORD_RETRY_COUNT = 3;
-const PASSPHRASE_RETRY_COUNT = 3;
 
 export const REMOTE_SSH_AUTHORITY = 'ssh-remote';
 
@@ -27,74 +16,10 @@ export function getRemoteAuthority(host: string) {
     return `${REMOTE_SSH_AUTHORITY}+${host}`;
 }
 
-interface SSHKey {
-    filename: string;
-    parsedKey: ParsedKey;
-    fingerprint: string;
-    agentSupport?: boolean;
-    isPrivate?: boolean;
-}
-
-
-/**
- * Split a ProxyCommand value into argv tokens.
- *
- * ssh-config v5.0.0 reassembles ProxyCommand's value into a single string (to
- * preserve quoting across the param boundary), but the spawn code expects
- * individual argv tokens. Calling `[].concat(someString)` does NOT split the
- * string — it wraps it, so `spawn()` ends up receiving the whole command
- * line as the executable path and fails with ENOENT. See
- * https://github.com/jeanp413/open-remote-ssh/issues/271 and
- * https://github.com/jeanp413/open-remote-ssh/issues/273.
- *
- * This helper mirrors OpenSSH's own ProxyCommand tokenization:
- * - whitespace separates tokens (outside quotes)
- * - double quotes group a single token
- * - backslash escapes the next character
- *
- * Array inputs are passed through for defensive compatibility with older
- * ssh-config versions.
- */
-function splitProxyCommand(value: string | string[]): string[] {
-    if (Array.isArray(value)) {return value.slice();}
-    const out: string[] = [];
-    let cur = '';
-    let i = 0;
-    let quoted = false;
-    let hasToken = false;
-    while (i < value.length) {
-        const ch = value[i];
-        if (ch === '\\' && i + 1 < value.length) {
-            cur += value[i + 1];
-            i += 2;
-            hasToken = true;
-            continue;
-        }
-        if (ch === '"') {
-            quoted = !quoted;
-            hasToken = true;
-            i += 1;
-            continue;
-        }
-        if (!quoted && /\s/.test(ch)) {
-            if (hasToken) { out.push(cur); cur = ''; hasToken = false; }
-            i += 1;
-            continue;
-        }
-        cur += ch;
-        hasToken = true;
-        i += 1;
-    }
-    if (hasToken) {out.push(cur);}
-    return out;
-}
 
 export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode.Disposable {
 
-    private proxyConnections: SSHConnection[] = [];
-    private sshConnection: SSHConnection | undefined;
     private sshCliSession: SSHCli | undefined;
-    private proxyCommandProcess: cp.ChildProcessWithoutNullStreams | undefined;
     private askpassServer: AskpassServer | undefined;
 
     private labelFormatterDisposable: vscode.Disposable | undefined;
@@ -131,6 +56,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         const remoteServerListenOnSocket = remoteSSHconfig.get<boolean>('remoteServerListenOnSocket', false)!;
         const connectTimeout = remoteSSHconfig.get<number>('connectTimeout', 60)!;
         const serverInstallPathMap = remoteSSHconfig.get<Record<string, string>>('serverInstallPath', {});
+        const sshPath = remoteSSHconfig.get<string>('path', '');
 
         return vscode.window.withProgress({
             title: `Setting up SSH Host ${sshDest.hostname}`,
@@ -144,18 +70,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
                 const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : (sshDest.port || 22);
 
-                // Check if SSH CLI mode is enabled (non-Windows, user preference)
-                const useSSHCli = !isWindows && remoteSSHconfig.get<boolean>('useSSHCli', true)!;
-
-                let session: ISSHSession;
-
-                if (useSSHCli) {
-                    // SSH CLI mode: use OS ssh binary with ControlMaster
-                    session = await this.connectWithSSHCli(sshDest, sshHostName, sshUser, sshPort, connectTimeout);
-                } else {
-                    // Legacy ssh2 library mode (Windows or user opted-out)
-                    session = await this.connectWithSSH2(sshDest, sshconfig, sshHostConfig, sshHostName, sshUser, sshPort, connectTimeout, enableAgentForwarding, context);
-                }
+                const session: ISSHSession = await this.connectWithSSHCli(sshDest, sshHostName, sshUser, sshPort, connectTimeout, sshPath || undefined);
 
                 const envVariables: Record<string, string | null> = {};
                 const sshHostConfig2 = sshconfig.getHostConfiguration(sshDest.hostname);
@@ -288,9 +203,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     }
 
     /**
-     * Connect using the OS ssh binary with ControlMaster (non-Windows).
+     * Connect using the OS ssh binary.
+     * On macOS/Linux: uses ControlMaster for connection multiplexing.
+     * On Windows: verifies connectivity with a direct ssh command.
      */
-    private async connectWithSSHCli(_sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, connectTimeout: number): Promise<ISSHSession> {
+    private async connectWithSSHCli(_sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, connectTimeout: number, sshPath?: string): Promise<ISSHSession> {
         this.logger.info(`Connecting with SSH CLI to ${sshHostName}:${sshPort}`);
 
         // Start askpass server
@@ -305,6 +222,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 port: sshPort,
                 username: sshUser,
                 connectTimeout,
+                sshPath,
             },
             this.logger,
             this.askpassServer
@@ -313,249 +231,6 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         await sshCli.connect();
         this.sshCliSession = sshCli;
         return sshCli;
-    }
-
-    /**
-     * Connect using the ssh2 library (Windows fallback or user preference).
-     */
-    private async connectWithSSH2(sshDest: SSHDestination, sshconfig: SSHConfiguration, sshHostConfig: Record<string, string>, sshHostName: string, sshUser: string, sshPort: number, connectTimeout: number, enableAgentForwarding: boolean, context: vscode.RemoteAuthorityResolverContext): Promise<ISSHSession> {
-        this.sshAgentSock = sshHostConfig['IdentityAgent'] || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
-        this.sshAgentSock = this.sshAgentSock ? untildify(this.sshAgentSock) : undefined;
-        const agentForward = enableAgentForwarding && (sshHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
-        const agent = agentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
-
-        const preferredAuthentications = sshHostConfig['PreferredAuthentications'] ? sshHostConfig['PreferredAuthentications'].split(',').map(s => s.trim()) : ['publickey', 'password', 'keyboard-interactive'];
-
-        const identityFiles: string[] = (sshHostConfig['IdentityFile'] as unknown as string[]) || [];
-        const identitiesOnly = (sshHostConfig['IdentitiesOnly'] || 'no').toLowerCase() === 'yes';
-        const identityKeys = await gatherIdentityFiles(identityFiles, this.sshAgentSock, identitiesOnly, this.logger);
-
-        // Create proxy jump connections if any
-        let proxyStream: ssh2.ClientChannel | stream.Duplex | undefined;
-        if (sshHostConfig['ProxyJump']) {
-            const proxyJumps = sshHostConfig['ProxyJump'].split(',').filter(i => !!i.trim())
-                .map(i => {
-                    const proxy = SSHDestination.parse(i);
-                    const proxyHostConfig = sshconfig.getHostConfiguration(proxy.hostname);
-                    return [proxy, proxyHostConfig] as [SSHDestination, Record<string, string>];
-                });
-            for (let i = 0; i < proxyJumps.length; i++) {
-                const [proxy, proxyHostConfig] = proxyJumps[i];
-                const proxyHostName = proxyHostConfig['HostName'] || proxy.hostname;
-                const proxyUser = proxyHostConfig['User'] || proxy.user || sshUser;
-                const proxyPort = proxyHostConfig['Port'] ? parseInt(proxyHostConfig['Port'], 10) : (proxy.port || sshPort);
-
-                const proxyAgentForward = enableAgentForwarding && (proxyHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
-                const proxyAgent = proxyAgentForward && this.sshAgentSock ? new ssh2.OpenSSHAgent(this.sshAgentSock) : undefined;
-
-                const proxyIdentityFiles: string[] = (proxyHostConfig['IdentityFile'] as unknown as string[]) || [];
-                const proxyIdentitiesOnly = (proxyHostConfig['IdentitiesOnly'] || 'no').toLowerCase() === 'yes';
-                const proxyIdentityKeys = await gatherIdentityFiles(proxyIdentityFiles, this.sshAgentSock, proxyIdentitiesOnly, this.logger);
-
-                const proxyAuthHandler = this.getSSHAuthHandler(proxyUser, proxyHostName, proxyIdentityKeys, preferredAuthentications);
-                const proxyConnection = new SSHConnection({
-                    host: !proxyStream ? proxyHostName : undefined,
-                    port: !proxyStream ? proxyPort : undefined,
-                    sock: proxyStream,
-                    username: proxyUser,
-                    readyTimeout: connectTimeout * 1000,
-                    keepaliveInterval: 60_000,
-                    keepaliveCountMax: 4,
-                    strictVendor: false,
-                    agentForward: proxyAgentForward,
-                    agent: proxyAgent,
-                    authHandler: (arg0, arg1, arg2) => (proxyAuthHandler(arg0, arg1, arg2), undefined)
-                });
-                this.proxyConnections.push(proxyConnection);
-
-                const nextProxyJump = i < proxyJumps.length - 1 ? proxyJumps[i + 1] : undefined;
-                const destIP = nextProxyJump ? (nextProxyJump[1]['HostName'] || nextProxyJump[0].hostname) : sshHostName;
-                const destPort = nextProxyJump ? ((nextProxyJump[1]['Port'] && parseInt(nextProxyJump[1]['Port'], 10)) || nextProxyJump[0].port || 22) : sshPort;
-                proxyStream = await proxyConnection.forwardOut('127.0.0.1', 0, destIP, destPort);
-            }
-        } else if (sshHostConfig['ProxyCommand']) {
-            let proxyArgs = splitProxyCommand(sshHostConfig['ProxyCommand'] as unknown as string | string[])
-                .map((arg) => arg.replace('%h', sshHostName).replace('%n', sshDest.hostname).replace('%p', sshPort.toString()).replace('%r', sshUser));
-            let proxyCommand = proxyArgs.shift()!;
-
-            let options = {};
-            if (isWindows && /\.(bat|cmd)$/.test(proxyCommand)) {
-                proxyCommand = `"${proxyCommand}"`;
-                proxyArgs = proxyArgs.map((arg) => arg.includes(' ') ? `"${arg}"` : arg);
-                options = { shell: true, windowsHide: true, windowsVerbatimArguments: true };
-            }
-
-            this.logger.trace(`Spawning ProxyCommand: ${proxyCommand} ${proxyArgs.join(' ')}`);
-
-            const child = cp.spawn(proxyCommand, proxyArgs, options);
-            proxyStream = stream.Duplex.from({ readable: child.stdout, writable: child.stdin });
-            this.proxyCommandProcess = child;
-        }
-
-        // Create final ssh connection
-        const sshAuthHandler = this.getSSHAuthHandler(sshUser, sshHostName, identityKeys, preferredAuthentications);
-
-        this.logger.info(`Establishing SSH connection to ${sshHostName}:${sshPort} (attempt #${context.resolveAttempt})`);
-        this.sshConnection = new SSHConnection({
-            host: !proxyStream ? sshHostName : undefined,
-            port: !proxyStream ? sshPort : undefined,
-            sock: proxyStream,
-            username: sshUser,
-            readyTimeout: connectTimeout * 1000,
-            keepaliveInterval: 60_000,
-            keepaliveCountMax: 4,
-            strictVendor: false,
-            agentForward,
-            agent,
-            authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
-        });
-        await this.sshConnection.connect();
-        this.logger.info(`SSH connection established successfully (attempt #${context.resolveAttempt})`);
-
-        // Wrap SSHConnection to conform to ISSHSession interface
-        return this.wrapSSHConnection(this.sshConnection);
-    }
-
-    /**
-     * Wrap an SSHConnection instance to conform to the ISSHSession interface.
-     */
-    private wrapSSHConnection(conn: SSHConnection): ISSHSession {
-        return {
-            exec: (cmd: string) => conn.exec(cmd),
-            execPartial: (cmd: string, tester: (stdout: string, stderr: string) => boolean) => conn.execPartial(cmd, tester),
-            forwardOut: (srcIP: string, srcPort: number, destIP: string, destPort: number) =>
-                conn.forwardOut(srcIP, srcPort, destIP, destPort) as Promise<stream.Duplex>,
-            forwardOutStreamLocal: (socketPath: string) =>
-                conn.forwardOutStreamLocal(socketPath) as Promise<stream.Duplex>,
-            close: () => conn.close(),
-        };
-    }
-
-    private sshAgentSock: string | undefined;
-
-    private getSSHAuthHandler(sshUser: string, sshHostName: string, identityKeys: SSHKey[], preferredAuthentications: string[]) {
-        let passwordRetryCount = PASSWORD_RETRY_COUNT;
-        let keyboardRetryCount = PASSWORD_RETRY_COUNT;
-        identityKeys = identityKeys.slice();
-        return async (methodsLeft: string[] | null, _partialSuccess: boolean | null, callback: (nextAuth: ssh2.AuthHandlerResult) => void) => {
-            if (methodsLeft === null) {
-                this.logger.info(`Trying no-auth authentication`);
-
-                return callback({
-                    type: 'none',
-                    username: sshUser,
-                });
-            }
-            if (methodsLeft.includes('publickey') && identityKeys.length && preferredAuthentications.includes('publickey')) {
-                const identityKey = identityKeys.shift()!;
-
-                this.logger.info(`Trying publickey authentication: ${identityKey.filename} ${identityKey.parsedKey.type} SHA256:${identityKey.fingerprint}`);
-
-                if (identityKey.agentSupport) {
-                    return callback({
-                        type: 'agent',
-                        username: sshUser,
-                        agent: new class extends ssh2.OpenSSHAgent {
-                            // Only return the current key
-                            override getIdentities(callback: (err: Error | undefined, publicKeys?: ParsedKey[]) => void): void {
-                                callback(undefined, [identityKey.parsedKey]);
-                            }
-                        }(this.sshAgentSock!)
-                    });
-                }
-                if (identityKey.isPrivate) {
-                    return callback({
-                        type: 'publickey',
-                        username: sshUser,
-                        key: identityKey.parsedKey
-                    });
-                }
-                if (!await fileExists(identityKey.filename)) {
-                    // Try next identity file
-					// eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    return callback(null as any);
-                }
-
-                const keyBuffer = await fs.promises.readFile(identityKey.filename);
-                let result = ssh2.utils.parseKey(keyBuffer); // First try without passphrase
-                if (result instanceof Error && result.message === 'Encrypted private OpenSSH key detected, but no passphrase given') {
-                    let passphraseRetryCount = PASSPHRASE_RETRY_COUNT;
-                    while (result instanceof Error && passphraseRetryCount > 0) {
-                        const passphrase = await vscode.window.showInputBox({
-                            title: `Enter passphrase for ${identityKey.filename}`,
-                            password: true,
-                            ignoreFocusOut: true
-                        });
-                        if (!passphrase) {
-                            break;
-                        }
-                        result = ssh2.utils.parseKey(keyBuffer, passphrase);
-                        passphraseRetryCount--;
-                    }
-                }
-                if (!result || result instanceof Error) {
-                    // Try next identity file
-					// eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    return callback(null as any);
-                }
-
-                const key = Array.isArray(result) ? result[0] : result;
-                return callback({
-                    type: 'publickey',
-                    username: sshUser,
-                    key
-                });
-            }
-            if (methodsLeft.includes('password') && passwordRetryCount > 0 && preferredAuthentications.includes('password')) {
-                if (passwordRetryCount === PASSWORD_RETRY_COUNT) {
-                    this.logger.info(`Trying password authentication`);
-                }
-
-                const password = await vscode.window.showInputBox({
-                    title: `Enter password for ${sshUser}@${sshHostName}`,
-                    password: true,
-                    ignoreFocusOut: true
-                });
-                passwordRetryCount--;
-
-                return callback(password
-                    ? {
-                        type: 'password',
-                        username: sshUser,
-                        password
-                    }
-                    : false);
-            }
-            if (methodsLeft.includes('keyboard-interactive') && keyboardRetryCount > 0 && preferredAuthentications.includes('keyboard-interactive')) {
-                if (keyboardRetryCount === PASSWORD_RETRY_COUNT) {
-                    this.logger.info(`Trying keyboard-interactive authentication`);
-                }
-
-                return callback({
-                    type: 'keyboard-interactive',
-                    username: sshUser,
-                    prompt: async (_name, _instructions, _instructionsLang, prompts, finish) => {
-                        const responses: string[] = [];
-                        for (const prompt of prompts) {
-                            const response = await vscode.window.showInputBox({
-                                title: `(${sshUser}@${sshHostName}) ${prompt.prompt}`,
-                                password: !prompt.echo,
-                                ignoreFocusOut: true
-                            });
-                            if (response === undefined) {
-                                keyboardRetryCount = 0;
-                                break;
-                            }
-                            responses.push(response);
-                        }
-                        keyboardRetryCount--;
-                        finish(responses);
-                    }
-                });
-            }
-
-            callback(false);
-        };
     }
 
     /**
@@ -573,36 +248,6 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             }
             this.sshCliSession = undefined;
         }
-
-        // Close proxy connections (outermost first closes the chain)
-        if (this.proxyConnections.length) {
-            try {
-                this.proxyConnections[0].close();
-            } catch (e) {
-                this.logger.trace(`Error closing proxy connections during cleanup: ${e}`);
-            }
-            this.proxyConnections = [];
-        }
-
-        // Close the main SSH connection
-        if (this.sshConnection) {
-            try {
-                this.sshConnection.close();
-            } catch (e) {
-                this.logger.trace(`Error closing SSH connection during cleanup: ${e}`);
-            }
-            this.sshConnection = undefined;
-        }
-
-        // Kill any lingering ProxyCommand process
-        if (this.proxyCommandProcess) {
-            try {
-                this.proxyCommandProcess.kill();
-            } catch (e) {
-                this.logger.trace(`Error killing proxy command process during cleanup: ${e}`);
-            }
-            this.proxyCommandProcess = undefined;
-        }
     }
 
     dispose() {
@@ -618,13 +263,6 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
             this.askpassServer = undefined;
         }
 
-        // If there's proxy connections then just close the parent connection
-        if (this.proxyConnections.length) {
-            this.proxyConnections[0].close();
-        } else {
-            this.sshConnection?.close();
-        }
-        this.proxyCommandProcess?.kill();
         this.labelFormatterDisposable?.dispose();
     }
 }

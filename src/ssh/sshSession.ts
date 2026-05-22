@@ -2,7 +2,7 @@ import * as stream from 'stream';
 
 /**
  * Common interface for SSH session implementations.
- * Both SSHConnection (ssh2 library) and SSHCli (OS ssh binary) implement this.
+ * SSHCli (OS ssh binary) implements this interface.
  */
 export interface ISSHSession {
 	/**
