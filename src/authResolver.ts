@@ -179,8 +179,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                             sock: proxyStream,
                             username: proxyUser,
                             readyTimeout: connectTimeout * 1000,
-                            keepaliveInterval: 15_000,
-                            keepaliveCountMax: 3,
+                            keepaliveInterval: 60_000,
+                            keepaliveCountMax: 4,
                             strictVendor: false,
                             agentForward: proxyAgentForward,
                             agent: proxyAgent,
@@ -222,8 +222,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     sock: proxyStream,
                     username: sshUser,
                     readyTimeout: connectTimeout * 1000,
-                    keepaliveInterval: 15_000,
-                    keepaliveCountMax: 3,
+                    keepaliveInterval: 60_000,
+                    keepaliveCountMax: 4,
                     strictVendor: false,
                     agentForward,
                     agent,
@@ -306,15 +306,19 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     } else if (result === retry) {
                         await vscode.commands.executeCommand('workbench.action.reloadWindow');
                     }
+
+                    // On initial connection, ServerInstallError is permanent (e.g. unsupported platform)
+                    if (e instanceof ServerInstallError || !(e instanceof Error)) {
+                        throw vscode.RemoteAuthorityResolverError.NotAvailable(e instanceof Error ? e.message : String(e));
+                    }
                 } else {
                     this.logger.info(`Reconnection attempt #${context.resolveAttempt} failed, will throw TemporarilyNotAvailable to trigger retry`);
                 }
 
-                if (e instanceof ServerInstallError || !(e instanceof Error)) {
-                    throw vscode.RemoteAuthorityResolverError.NotAvailable(e instanceof Error ? e.message : String(e));
-                } else {
-                    throw vscode.RemoteAuthorityResolverError.TemporarilyNotAvailable(e.message);
-                }
+                // On reconnection attempts, all errors are retryable to allow
+                // VSCode's reconnection loop to keep trying (grace time: 3 hours)
+                const message = e instanceof Error ? e.message : String(e);
+                throw vscode.RemoteAuthorityResolverError.TemporarilyNotAvailable(message);
             }
         });
     }
