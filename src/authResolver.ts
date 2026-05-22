@@ -121,11 +121,43 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const listeningOn = installResult.listeningOn;
                 const resolvedResult: vscode.ResolverResult = new vscode.ManagedResolvedAuthority(
                     async () => {
+                        // Check if the SSH session is still alive before opening a channel.
+                        // If dead (e.g., network outage killed ControlMaster), re-establish
+                        // the connection transparently. VSCode's reconnection loop calls
+                        // makeConnection() on each retry attempt, so we get a chance to
+                        // recover here without triggering a permanent failure.
+                        if (!currentSession.isAlive()) {
+                            this.logger.info('SSH session is dead, attempting to reconnect...');
+                            try {
+                                await currentSession.reconnect();
+                                this.logger.info('SSH session reconnected successfully in makeConnection()');
+                            } catch (reconnectErr) {
+                                this.logger.error('SSH reconnection failed in makeConnection()', reconnectErr);
+                                // Throw with network error code so VSCode's reconnection loop
+                                // recognizes this as retryable (ECONNRESET + syscall 'connect')
+                                const err = new Error(`SSH reconnection failed: ${reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr)}`);
+                                (err as any).code = 'ECONNRESET';
+                                (err as any).syscall = 'connect';
+                                throw err;
+                            }
+                        }
+
                         let channel: stream.Duplex;
-                        if (typeof listeningOn === 'number') {
-                            channel = await currentSession.forwardOut('127.0.0.1', 0, '127.0.0.1', listeningOn);
-                        } else {
-                            channel = await currentSession.forwardOutStreamLocal(listeningOn);
+                        try {
+                            if (typeof listeningOn === 'number') {
+                                channel = await currentSession.forwardOut('127.0.0.1', 0, '127.0.0.1', listeningOn);
+                            } else {
+                                channel = await currentSession.forwardOutStreamLocal(listeningOn);
+                            }
+                        } catch (forwardErr) {
+                            this.logger.error('Failed to open SSH channel', forwardErr);
+                            // If forwardOut fails even after isAlive() returned true,
+                            // the session might have died between the check and the forward.
+                            // Throw with retryable error code.
+                            const err = new Error(`SSH channel open failed: ${forwardErr instanceof Error ? forwardErr.message : String(forwardErr)}`);
+                            (err as any).code = 'ECONNRESET';
+                            (err as any).syscall = 'connect';
+                            throw err;
                         }
                         return this.createManagedMessagePassingFromStream(channel);
                     },

@@ -26,6 +26,17 @@ export interface ISSHSession {
 	forwardOutStreamLocal(socketPath: string): Promise<stream.Duplex>;
 
 	/**
+	 * Check if the SSH session is still alive and usable.
+	 */
+	isAlive(): boolean;
+
+	/**
+	 * Re-establish the SSH connection after a disconnect.
+	 * Cleans up stale resources and creates a fresh connection.
+	 */
+	reconnect(): Promise<void>;
+
+	/**
 	 * Close the SSH session and clean up resources.
 	 */
 	close(): Promise<void>;
