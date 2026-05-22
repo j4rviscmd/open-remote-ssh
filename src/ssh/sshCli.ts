@@ -400,6 +400,84 @@ export class SSHCli implements ISSHSession {
 	}
 
 	/**
+	 * Check if the SSH session is still alive and usable.
+	 * On macOS/Linux: verifies the ControlMaster socket with `-O check`.
+	 * On Windows: checks the `connected` flag (no persistent connection to verify).
+	 */
+	isAlive(): boolean {
+		if (!this.connected) {
+			return false;
+		}
+
+		if (this.useControlMaster) {
+			// Verify ControlMaster socket is responsive
+			try {
+				const result = cp.spawnSync(this.sshBinary, [
+					'-o', `ControlPath=${this.controlPath}`,
+					'-O', 'check',
+					`${this.config.username}@${this.config.host}`,
+				], { timeout: 5000 });
+
+				return result.status === 0;
+			} catch {
+				return false;
+			}
+		}
+
+		// On Windows (direct mode), we can't cheaply verify connectivity
+		// without spawning a new SSH process. Return `connected` flag as best effort.
+		return this.connected;
+	}
+
+	/**
+	 * Re-establish the SSH connection after a disconnect.
+	 * Cleans up stale resources (dead ControlMaster, orphan processes)
+	 * and creates a fresh connection.
+	 */
+	async reconnect(): Promise<void> {
+		this.logger.info('Reconnecting SSH session...');
+
+		// Kill any lingering child processes from the dead session
+		for (const proc of this.childProcesses) {
+			try { proc.kill(); } catch { /* ignore */ }
+		}
+		this.childProcesses = [];
+
+		// Clean up stale ControlMaster (macOS/Linux)
+		if (this.useControlMaster) {
+			// Try graceful exit first (might fail if ControlMaster is unresponsive)
+			try {
+				cp.spawnSync(this.sshBinary, [
+					'-o', `ControlPath=${this.controlPath}`,
+					'-O', 'exit',
+					`${this.config.username}@${this.config.host}`,
+				], { timeout: 3000 });
+			} catch { /* ignore */ }
+
+			// Kill master process if still tracked
+			if (this.masterProcess) {
+				try { this.masterProcess.kill(); } catch { /* ignore */ }
+				this.masterProcess = undefined;
+			}
+
+			// Remove stale socket file
+			try {
+				if (fs.existsSync(this.controlPath)) {
+					fs.unlinkSync(this.controlPath);
+				}
+			} catch { /* ignore */ }
+		}
+
+		// Reset state
+		this.connected = false;
+
+		// Re-establish the connection
+		await this.connect();
+
+		this.logger.info('SSH session reconnected successfully');
+	}
+
+	/**
 	 * Close the SSH session and clean up all resources.
 	 */
 	async close(): Promise<void> {
