@@ -19,6 +19,10 @@ export interface SSHCliConfig {
 	extraArgs?: string[];
 	/** Connection timeout in seconds */
 	connectTimeout?: number;
+	/** Seconds between keepalive packets (respects ~/.ssh/config, fallback: 30) */
+	serverAliveInterval?: number;
+	/** Max failed keepalive before disconnect (respects ~/.ssh/config, fallback: 120) */
+	serverAliveCountMax?: number;
 	/** Custom path to the ssh binary (defaults to 'ssh' in PATH) */
 	sshPath?: string;
 }
@@ -546,8 +550,8 @@ export class SSHCli implements ISSHSession {
 		const args: string[] = [
 			'-o', 'StrictHostKeyChecking=accept-new',
 			'-o', `ConnectTimeout=${this.config.connectTimeout || 60}`,
-			'-o', 'ServerAliveInterval=60',
-			'-o', 'ServerAliveCountMax=4',
+			'-o', `ServerAliveInterval=${this.config.serverAliveInterval ?? 30}`,
+			'-o', `ServerAliveCountMax=${this.config.serverAliveCountMax ?? 120}`,
 			'-p', this.config.port.toString(),
 		];
 
