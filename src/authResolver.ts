@@ -54,7 +54,6 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         const defaultExtensions = remoteSSHconfig.get<string[]>('defaultExtensions', []);
         const remotePlatformMap = remoteSSHconfig.get<Record<string, string>>('remotePlatform', {});
         const remoteServerListenOnSocket = remoteSSHconfig.get<boolean>('remoteServerListenOnSocket', false)!;
-        const connectTimeout = remoteSSHconfig.get<number>('connectTimeout', 60)!;
         const serverInstallPathMap = remoteSSHconfig.get<Record<string, string>>('serverInstallPath', {});
         const sshPath = remoteSSHconfig.get<string>('path', '');
 
@@ -69,10 +68,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const sshHostName = sshHostConfig['HostName'] ? sshHostConfig['HostName'].replace('%h', sshDest.hostname) : sshDest.hostname;
                 const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
                 const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : (sshDest.port || 22);
-                const sshServerAliveInterval = sshHostConfig['ServerAliveInterval'] ? parseInt(sshHostConfig['ServerAliveInterval'], 10) : undefined;
-                const sshServerAliveCountMax = sshHostConfig['ServerAliveCountMax'] ? parseInt(sshHostConfig['ServerAliveCountMax'], 10) : undefined;
-
-                const session: ISSHSession = await this.connectWithSSHCli(sshDest, sshHostName, sshUser, sshPort, connectTimeout, sshPath || undefined, sshServerAliveInterval, sshServerAliveCountMax);
+                const session: ISSHSession = await this.connectWithSSHCli(sshDest, sshHostName, sshUser, sshPort, sshPath || undefined);
 
                 const envVariables: Record<string, string | null> = {};
                 const sshHostConfig2 = sshconfig.getHostConfiguration(sshDest.hostname);
@@ -241,7 +237,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
      * On macOS/Linux: uses ControlMaster for connection multiplexing.
      * On Windows: verifies connectivity with a direct ssh command.
      */
-    private async connectWithSSHCli(_sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, connectTimeout: number, sshPath?: string, serverAliveInterval?: number, serverAliveCountMax?: number): Promise<ISSHSession> {
+    private async connectWithSSHCli(_sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, sshPath?: string): Promise<ISSHSession> {
         this.logger.info(`Connecting with SSH CLI to ${sshHostName}:${sshPort}`);
 
         // Start askpass server
@@ -255,10 +251,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 host: sshHostName,
                 port: sshPort,
                 username: sshUser,
-                connectTimeout,
                 sshPath,
-                serverAliveInterval,
-                serverAliveCountMax,
             },
             this.logger,
             this.askpassServer

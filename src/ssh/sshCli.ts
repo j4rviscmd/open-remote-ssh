@@ -17,23 +17,6 @@ export interface SSHCliConfig {
 	username: string;
 	/** Additional SSH options (e.g., from ssh_config) */
 	extraArgs?: string[];
-	/** Connection timeout in seconds */
-	connectTimeout?: number;
-	/**
-	 * Seconds between keepalive packets for ControlMaster connections.
-	 * Only applies to ControlMaster (macOS/Linux); Direct Mode (Windows)
-	 * does NOT set ServerAliveInterval, matching MS Remote SSH behavior
-	 * (delegates to ssh_config / OpenSSH defaults).
-	 * Default: 30
-	 */
-	serverAliveInterval?: number;
-	/**
-	 * Max failed keepalive before disconnect for ControlMaster connections.
-	 * Only applies to ControlMaster (macOS/Linux); Direct Mode (Windows)
-	 * does NOT set ServerAliveCountMax, matching MS Remote SSH behavior.
-	 * Default: 3 (OpenSSH default)
-	 */
-	serverAliveCountMax?: number;
 	/** Custom path to the ssh binary (defaults to 'ssh' in PATH) */
 	sshPath?: string;
 }
@@ -106,8 +89,6 @@ export class SSHCli implements ISSHSession {
 	 */
 	private async connectWithControlMaster(): Promise<void> {
 		const args = this.buildSSHArgs([
-			'-o', `ServerAliveInterval=${this.config.serverAliveInterval ?? 30}`,
-			'-o', `ServerAliveCountMax=${this.config.serverAliveCountMax ?? 3}`,
 			'-o', 'ControlMaster=yes',
 			'-o', `ControlPath=${this.controlPath}`,
 			'-o', 'ControlPersist=yes',
@@ -145,7 +126,7 @@ export class SSHCli implements ISSHSession {
 			});
 
 			// Wait for the control socket to appear
-			this.waitForControlSocket(this.config.connectTimeout || 60)
+			this.waitForControlSocket(60)
 				.then(() => {
 					this.connected = true;
 					this.logger.info('ControlMaster connection established');
@@ -556,17 +537,13 @@ export class SSHCli implements ISSHSession {
 
 	/**
 	 * Build base SSH args common to all operations.
-	 * Note: ServerAliveInterval/ServerAliveCountMax are NOT set here.
-	 * - ControlMaster: keepalive is added in connectWithControlMaster() only
-	 * - Direct Mode (Windows): no keepalive override, matching MS Remote SSH
-	 *   behavior (delegates to ssh_config / OpenSSH defaults where interval=0)
+	 * No SSH options are overridden here — delegates all behavior to
+	 * ~/.ssh/config and OpenSSH defaults for full user config respect.
 	 * @param extraArgs - SSH options to place before user@host
 	 * @param remoteCommand - Optional command to execute on the remote (placed after user@host)
 	 */
 	private buildSSHArgs(extraArgs: string[], remoteCommand?: string): string[] {
 		const args: string[] = [
-			'-o', 'StrictHostKeyChecking=accept-new',
-			'-o', `ConnectTimeout=${this.config.connectTimeout || 60}`,
 			'-p', this.config.port.toString(),
 		];
 
