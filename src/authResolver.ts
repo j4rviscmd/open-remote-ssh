@@ -12,11 +12,27 @@ import { isNullable } from '@zokugun/is-it-type';
 
 export const REMOTE_SSH_AUTHORITY = 'ssh-remote';
 
+/**
+ * Build the VS Code remote authority string for an SSH host.
+ *
+ * @param host - The hostname or SSH config alias
+ * @returns The authority string in the form `ssh-remote+<host>`
+ */
 export function getRemoteAuthority(host: string) {
     return `${REMOTE_SSH_AUTHORITY}+${host}`;
 }
 
 
+/**
+ * VS Code remote authority resolver for SSH connections.
+ *
+ * Handles the full lifecycle of an SSH remote session:
+ * 1. Parses the remote authority and SSH config
+ * 2. Establishes an SSH connection via the OS `ssh` binary
+ * 3. Installs/locates the VS Code server on the remote host
+ * 4. Provides a managed message-passing channel for VS Code communication
+ * 5. Supports automatic reconnection on session failure
+ */
 export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode.Disposable {
 
     private sshCliSession: SSHCli | undefined;
@@ -30,6 +46,18 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
     ) {
     }
 
+    /**
+     * Resolve a remote SSH authority.
+     *
+     * Called by VS Code when opening a remote SSH window or when reconnecting.
+     * On reconnection attempts (`context.resolveAttempt > 1`), stale connections
+     * from the previous resolve are cleaned up before retrying.
+     *
+     * @param authority - The remote authority string (`ssh-remote+<host>`)
+     * @param context - Resolver context including the current attempt number
+     * @returns A resolver result with a managed connection to the remote VS Code server
+     * @throws {vscode.RemoteAuthorityResolverError} On permanent or retryable failures
+     */
     resolve(authority: string, context: vscode.RemoteAuthorityResolverContext): Thenable<vscode.ResolverResult> {
         const [type, dest] = authority.split('+');
         if (type !== REMOTE_SSH_AUTHORITY) {
@@ -71,8 +99,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const session: ISSHSession = await this.connectWithSSHCli(sshDest, sshHostName, sshUser, sshPort, sshPath || undefined);
 
                 const envVariables: Record<string, string | null> = {};
-                const sshHostConfig2 = sshconfig.getHostConfiguration(sshDest.hostname);
-                const agentForward = enableAgentForwarding && (sshHostConfig2['ForwardAgent'] || 'no').toLowerCase() === 'yes';
+                const agentForward = enableAgentForwarding && (sshHostConfig['ForwardAgent'] || 'no').toLowerCase() === 'yes';
                 if (agentForward) {
                     envVariables['SSH_AUTH_SOCK'] = null;
                 }
@@ -195,6 +222,15 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         });
     }
 
+    /**
+     * Wrap a Node.js Duplex stream as a VS Code ManagedMessagePassing instance.
+     *
+     * Bridges the SSH channel's stream-based API to VS Code's event-driven
+     * message passing interface used by ManagedResolvedAuthority.
+     *
+     * @param channel - The duplex stream (from SSH forwarding)
+     * @returns A ManagedMessagePassing adapter for VS Code
+     */
     private createManagedMessagePassingFromStream(channel: stream.Duplex): vscode.ManagedMessagePassing {
         const messageEmitter = new vscode.EventEmitter<Uint8Array>();
         const closeEmitter = new vscode.EventEmitter<Error | undefined>();
@@ -234,10 +270,23 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     /**
      * Connect using the OS ssh binary.
+     *
      * On macOS/Linux: uses ControlMaster for connection multiplexing.
      * On Windows: verifies connectivity with a direct ssh command.
+     *
+     * Passes `sshDest.hostname` as `hostAlias` to {@link SSHCli} so that the
+     * original SSH config alias is preserved as the SSH target. This ensures
+     * `~/.ssh/config` Host blocks (ProxyJump, IdentityFile, ServerAliveInterval,
+     * etc.) are correctly matched rather than bypassed by the resolved IP.
+     *
+     * @param sshDest - Parsed SSH destination (hostname may be an alias from `~/.ssh/config`)
+     * @param sshHostName - Resolved IP/hostname from the SSH config HostName directive
+     * @param sshUser - Resolved username (from SSH config, destination, or OS default)
+     * @param sshPort - Resolved port number (from SSH config or destination, defaults to 22)
+     * @param sshPath - Optional custom path to the ssh binary
+     * @returns An active SSH session
      */
-    private async connectWithSSHCli(_sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, sshPath?: string): Promise<ISSHSession> {
+    private async connectWithSSHCli(sshDest: SSHDestination, sshHostName: string, sshUser: string, sshPort: number, sshPath?: string): Promise<ISSHSession> {
         this.logger.info(`Connecting with SSH CLI to ${sshHostName}:${sshPort}`);
 
         // Start askpass server
@@ -251,6 +300,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 host: sshHostName,
                 port: sshPort,
                 username: sshUser,
+                hostAlias: sshDest.hostname,
                 sshPath,
             },
             this.logger,
@@ -279,6 +329,12 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         }
     }
 
+    /**
+     * Dispose of all resources held by this resolver.
+     *
+     * Closes the active SSH session, stops the askpass server, and
+     * unregisters the resource label formatter.
+     */
     dispose() {
         // Close SSH CLI session
         if (this.sshCliSession) {

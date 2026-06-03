@@ -11,13 +11,30 @@ import { AskpassServer } from './askpassServer';
 import { isWindows } from '../common/platform';
 import { findRandomPort } from '../common/ports';
 
+/**
+ * Configuration for establishing an SSH CLI session.
+ *
+ * When `hostAlias` is provided, it is used as the SSH target in all command
+ * arguments so that `~/.ssh/config` Host blocks (ProxyJump, IdentityFile,
+ * ServerAliveInterval, etc.) are correctly matched. Otherwise the resolved
+ * `host` IP/hostname is used directly.
+ */
 export interface SSHCliConfig {
+	/** Resolved hostname or IP address of the remote host. */
 	host: string;
+	/** Port number for the SSH connection. */
 	port: number;
+	/** Username for the SSH connection. */
 	username: string;
-	/** Additional SSH options (e.g., from ssh_config) */
+	/**
+	 * SSH config alias (e.g., `raspi`). When set, used as the SSH target
+	 * instead of the resolved `host` so that `~/.ssh/config` Host blocks
+	 * (ProxyJump, IdentityFile, ServerAliveInterval, etc.) are matched.
+	 */
+	hostAlias?: string;
+	/** Additional SSH options (e.g., from ssh_config). */
 	extraArgs?: string[];
-	/** Custom path to the ssh binary (defaults to 'ssh' in PATH) */
+	/** Custom path to the ssh binary (defaults to `ssh` in PATH). */
 	sshPath?: string;
 }
 
@@ -413,7 +430,7 @@ export class SSHCli implements ISSHSession {
 				const result = cp.spawnSync(this.sshBinary, [
 					'-o', `ControlPath=${this.controlPath}`,
 					'-O', 'check',
-					`${this.config.username}@${this.config.host}`,
+					`${this.config.username}@${this.getSSHTarget()}`,
 				], { timeout: 5000 });
 
 				return result.status === 0;
@@ -448,7 +465,7 @@ export class SSHCli implements ISSHSession {
 				cp.spawnSync(this.sshBinary, [
 					'-o', `ControlPath=${this.controlPath}`,
 					'-O', 'exit',
-					`${this.config.username}@${this.config.host}`,
+					`${this.config.username}@${this.getSSHTarget()}`,
 				], { timeout: 3000 });
 			} catch { /* ignore */ }
 
@@ -495,7 +512,7 @@ export class SSHCli implements ISSHSession {
 				const args = [
 					'-o', `ControlPath=${this.controlPath}`,
 					'-O', 'exit',
-					`${this.config.username}@${this.config.host}`,
+					`${this.config.username}@${this.getSSHTarget()}`,
 				];
 
 				this.logger.trace(`Closing ControlMaster: ${this.sshBinary} ${args.join(' ')}`);
@@ -529,6 +546,15 @@ export class SSHCli implements ISSHSession {
 
 	// --- Private helpers ---
 
+	/**
+	 * Return the SSH target to use in command arguments.
+	 * Prefers hostAlias (SSH config alias) so that ~/.ssh/config Host blocks are matched.
+	 * Falls back to the resolved host when no alias is available.
+	 */
+	private getSSHTarget(): string {
+		return this.config.hostAlias || this.config.host;
+	}
+
 	private ensureConnected(): void {
 		if (!this.connected) {
 			throw new Error('SSH session not connected. Call connect() first.');
@@ -552,7 +578,7 @@ export class SSHCli implements ISSHSession {
 		}
 
 		args.push(...extraArgs);
-		args.push(`${this.config.username}@${this.config.host}`);
+		args.push(`${this.config.username}@${this.getSSHTarget()}`);
 
 		if (remoteCommand) {
 			args.push(remoteCommand);
@@ -574,7 +600,7 @@ export class SSHCli implements ISSHSession {
 		];
 
 		args.push(...sshOptions);
-		args.push(`${this.config.username}@${this.config.host}`);
+		args.push(`${this.config.username}@${this.getSSHTarget()}`);
 
 		if (remoteCommand) {
 			args.push(remoteCommand);
@@ -617,7 +643,7 @@ export class SSHCli implements ISSHSession {
 				const result = cp.spawnSync(this.sshBinary, [
 					'-o', `ControlPath=${this.controlPath}`,
 					'-O', 'check',
-					`${this.config.username}@${this.config.host}`,
+					`${this.config.username}@${this.getSSHTarget()}`,
 				], { timeout: 5000 });
 
 				if (result.status === 0) {
